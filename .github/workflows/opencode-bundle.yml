@@ -1,0 +1,103 @@
+name: OpenCode Server Bundle
+
+# Builds the opencode v2 server as a pure-JS Node bundle:
+#
+#   packages/cli/dist-node/opencode.mjs      <- entry point (ESM)
+#   packages/cli/dist-node/assets/**         <- wasm / archive / helper assets
+#
+# The bundle is platform independent: the Bun-only code paths are selected by
+# the "#imports" condition map, and the Node build resolves the `node`
+# variants (node:http, node:sqlite, node:sea). That is what lets the server
+# run inside the Android APK on our own Node-for-Android runtime.
+#
+# The arch-specific native assets that get collected on the build host
+# (parcel watcher, node-pty, fff/ffi-rs) are glibc binaries and are pruned
+# here: on Android they cannot load, and the server degrades gracefully
+# (file watching disabled, ripgrep fallback, no terminal).
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - 'feature/embedded-opencode-server'
+    paths:
+      - '.github/workflows/opencode-bundle.yml'
+  schedule:
+    - cron: '23 5 * * 1'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: opencode-bundle-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: bundle-${{ matrix.channel }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - channel: latest
+            ref: 'v2.1.0'
+
+    env:
+      OPENCODE_REF: ${{ matrix.ref }}
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          repository: anomalyco/opencode
+          ref: ${{ matrix.ref }}
+          path: opencode-src
+          submodules: false
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 'lts/*'
+
+      - name: Install dependencies
+        working-directory: opencode-src
+        run: |
+          set -euo pipefail
+          bun install --frozen-lockfile --os=* --cpu=*
+
+      - name: Build Node bundle
+        working-directory: opencode-src/packages/cli
+        run: |
+          set -euo pipefail
+          bun run script/build-node.ts --bundle-only
+
+      - name: Prune host-specific native assets
+        working-directory: opencode-src/packages/cli
+        run: |
+          set -euo pipefail
+          # These are glibc binaries for the build host; they cannot load on
+          # Android and every consumer already handles their absence.
+          rm -rf dist-node/assets/@parcel dist-node/assets/@lydell \
+                 dist-node/assets/@ff-labs dist-node/assets/@yuuang \
+                 dist-node/assets/opencode-pty
+          # The tree-sitter/photon wasm + the web UI archive must stay.
+          ls -la dist-node/assets | head -30
+          du -sh dist-node
+
+      - name: Smoke test bundle
+        working-directory: opencode-src/packages/cli
+        run: |
+          set -euo pipefail
+          node --version
+          # `opencode --version` must work from the bundle alone.
+          node dist-node/opencode.mjs --version
+
+      - name: Upload bundle
+        uses: actions/upload-artifact@v7
+        with:
+          name: opencode-server-bundle-${{ matrix.channel }}
+          path: opencode-src/packages/cli/dist-node
+          retention-days: 14
