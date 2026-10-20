@@ -10,6 +10,9 @@ name: Node.js for Android
 # The produced binary is a plain ELF executable that runs on bionic devices.
 
 on:
+  # Called by android.yml so the APK build always embeds a freshly built
+  # runtime (artifacts are shared inside the same workflow run).
+  workflow_call:
   workflow_dispatch:
   push:
     branches:
@@ -86,6 +89,13 @@ jobs:
           export PATH="$TOOLCHAIN:$PATH"
           export CC="$TOOLCHAIN/${{ matrix.toolchain }}$ANDROID_API-clang"
           export CXX="$TOOLCHAIN/${{ matrix.toolchain }}$ANDROID_API-clang++"
+
+          # Host tools (torque, mksnapshot) are built for the runner, not for
+          # Android. Without CC_host/CXX_host the NDK compiler is used for
+          # host objects too and bionic's missing execinfo.h breaks V8's
+          # stack_trace_posix.cc.
+          export CC_host=gcc CXX_host=g++ LINK_host=g++ AR_host=ar
+          export RANLIB_host=ranlib NM_host=nm OBJCOPY_host=objcopy STRIP_host=strip
           export GYP_DEFINES="target_arch=${{ matrix.dest_cpu }} \
             v8_target_arch=${{ matrix.dest_cpu }} \
             android_target_arch=${{ matrix.dest_cpu }} \
@@ -106,9 +116,25 @@ jobs:
         working-directory: node-src
         run: |
           set -euo pipefail
+          # gyp runs during `make` and bakes the compiler commands into the
+          # makefiles, so the host toolchain must be exported here as well.
+          export CC_host=gcc CXX_host=g++ LINK_host=g++ AR_host=ar
+          export RANLIB_host=ranlib NM_host=nm OBJCOPY_host=objcopy STRIP_host=strip
           make -j"$(nproc)"
           ls -lh out/Release/node
           file out/Release/node || true
+
+      - name: Inspect runtime
+        working-directory: node-src
+        run: |
+          set -euo pipefail
+          NDK="$ANDROID_HOME/ndk/$NDK_VERSION"
+          READELF="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf"
+          # The APK has to carry every non-system library the runtime links.
+          echo "--- NEEDED ---"
+          "$READELF" -d out/Release/node | grep NEEDED || true
+          echo "--- size ---"
+          du -h out/Release/node
 
       - name: Smoke test (host, if runnable)
         working-directory: node-src
@@ -128,4 +154,63 @@ jobs:
           name: node-android-${{ matrix.arch }}
           path: |
             node-src/out/Release/node
+          retention-days: 14
+
+  # ============================================
+  # ripgrep for the agent's search tool
+  # ============================================
+  ripgrep:
+    name: ripgrep-${{ matrix.arch }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: arm64
+            target: aarch64-linux-android
+            cc: aarch64-linux-android24-clang
+            cc_env: CC_aarch64_linux_android
+            ar_env: AR_aarch64_linux_android
+            link_env: CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER
+          - arch: arm
+            target: armv7-linux-androideabi
+            cc: armv7a-linux-androideabi24-clang
+            cc_env: CC_armv7_linux_androideabi
+            ar_env: AR_armv7_linux_androideabi
+            link_env: CARGO_TARGET_ARMV7_LINUX_ANDROIDEABI_LINKER
+
+    env:
+      NDK_VERSION: '29.0.14206865'
+
+    steps:
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: android-actions/setup-android@v3
+        with:
+          packages: 'platform-tools'
+
+      - name: Install NDK
+        run: sdkmanager "ndk;$NDK_VERSION"
+
+      - name: Build ripgrep (${{ matrix.arch }})
+        run: |
+          set -euo pipefail
+          NDK="$ANDROID_HOME/ndk/$NDK_VERSION"
+          TOOLCHAIN="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          export PATH="$TOOLCHAIN:$PATH"
+          export "${{ matrix.link_env }}"="$TOOLCHAIN/${{ matrix.cc }}"
+          export "${{ matrix.cc_env }}"="$TOOLCHAIN/${{ matrix.cc }}"
+          export "${{ matrix.ar_env }}"="$TOOLCHAIN/llvm-ar"
+          # No PCRE2: opencode only uses the default regex engine.
+          cargo install ripgrep --version 14.1.1 --locked --no-default-features \
+            --target ${{ matrix.target }} --root "$RUNNER_TEMP/rg"
+          file "$RUNNER_TEMP/rg/bin/rg"
+          "$RUNNER_TEMP/rg/bin/rg" --version || true
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ripgrep-android-${{ matrix.arch }}
+          path: ${{ runner.temp }}/rg/bin/rg
           retention-days: 14

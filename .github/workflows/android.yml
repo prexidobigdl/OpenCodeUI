@@ -4,19 +4,29 @@ name: Android Universal APK
 # native libraries, so the app installs on 64-bit and legacy 32-bit devices
 # alike.
 #
+# The APK is self contained: it carries the Node.js runtime (built for bionic),
+# ripgrep and the opencode server bundle, so the app *is* the opencode server.
+#
 # Flow:
-#   1. build-abi  : build one APK per ABI (parallel matrix)
-#   2. merge      : splice both lib/<abi> trees into a single universal APK,
-#                   align it, sign it, upload it (and publish a release on tags)
+#   1. node-runtime  : Node.js for arm64 + armv7 (reusable workflow)
+#   2. server-bundle : opencode v2 server as a Node bundle (reusable workflow)
+#   3. build-abi     : embed runtime + bundle, build one APK per ABI
+#   4. merge         : splice both lib/<abi> trees into a single universal APK,
+#                      align it and sign it with the release key
+#
+# Publishing a GitHub release is a separate, manual workflow (release.yml).
 
 on:
   workflow_dispatch:
   push:
+    branches:
+      - 'main'
+      - 'feature/**'
     tags:
       - 'v*'
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: android-universal-${{ github.ref }}
@@ -24,11 +34,23 @@ concurrency:
 
 jobs:
   # ============================================
+  # Embedded runtime + server bundle
+  # ============================================
+  node-runtime:
+    name: Node runtime
+    uses: ./.github/workflows/node-android.yml
+
+  server-bundle:
+    name: opencode server bundle
+    uses: ./.github/workflows/opencode-bundle.yml
+
+  # ============================================
   # Per-ABI builds
   # ============================================
   build-abi:
     name: Build ${{ matrix.label }}
     runs-on: ubuntu-latest
+    needs: [node-runtime, server-bundle]
     strategy:
       fail-fast: false
       matrix:
@@ -36,9 +58,18 @@ jobs:
           - target: aarch64
             rust_target: aarch64-linux-android
             label: arm64
+            arch: arm64
+            abi: arm64-v8a
+            node_triple: aarch64-linux-android
           - target: armv7
             rust_target: armv7-linux-androideabi
             label: armv7
+            arch: arm
+            abi: armeabi-v7a
+            node_triple: armv7a-linux-androideabi
+
+    env:
+      NDK_VERSION: '29.0.14206865'
 
     steps:
       - uses: actions/checkout@v6
@@ -59,7 +90,69 @@ jobs:
         with:
           packages: 'platform-tools build-tools;36.0.0'
 
-      - run: sdkmanager "ndk;29.0.14206865"
+      - run: sdkmanager "ndk;$NDK_VERSION"
+
+      # --- embedded payload ------------------------------------------------
+
+      - name: Download Node runtime
+        uses: actions/download-artifact@v8
+        with:
+          name: node-android-${{ matrix.arch }}
+          path: node-runtime
+
+      - name: Download ripgrep
+        uses: actions/download-artifact@v8
+        with:
+          name: ripgrep-android-${{ matrix.arch }}
+          path: ripgrep
+
+      - name: Download opencode server bundle
+        uses: actions/download-artifact@v8
+        with:
+          name: opencode-server-bundle-latest
+          path: server-bundle
+
+      - name: Embed runtime + server
+        run: |
+          set -euo pipefail
+          LIBDIR="src-tauri/gen/android/app/src/main/jniLibs/${{ matrix.abi }}"
+          ASSETS="src-tauri/gen/android/app/src/main/assets/opencode"
+          mkdir -p "$LIBDIR" "$ASSETS"
+
+          NODE=$(find node-runtime -type f -name node | head -1)
+          [ -n "$NODE" ] || { echo "::error::node runtime artifact is empty"; exit 1; }
+          cp "$NODE" "$LIBDIR/libopencode_node.so"
+          chmod 755 "$LIBDIR/libopencode_node.so"
+
+          RG=$(find ripgrep -type f -name rg | head -1)
+          [ -n "$RG" ] || { echo "::error::ripgrep artifact is empty"; exit 1; }
+          cp "$RG" "$LIBDIR/librg.so"
+          chmod 755 "$LIBDIR/librg.so"
+
+          # libc++_shared resolved from nativeLibraryDir when the runtime
+          # needs it (harmless when node links it statically).
+          LLVM="$ANDROID_HOME/ndk/$NDK_VERSION/toolchains/llvm/prebuilt/linux-x86_64"
+          CXX_SHARED="$LLVM/sysroot/usr/lib/${{ matrix.node_triple }}/libc++_shared.so"
+          if [ -f "$CXX_SHARED" ]; then
+            cp "$CXX_SHARED" "$LIBDIR/libc++_shared.so"
+          fi
+
+          ENTRY=$(find server-bundle -name opencode.mjs | head -1)
+          [ -n "$ENTRY" ] || { echo "::error::server bundle artifact is empty"; exit 1; }
+          SRC=$(dirname "$ENTRY")
+          rm -rf "$ASSETS"
+          mkdir -p "$ASSETS"
+          cp -R "$SRC/." "$ASSETS/"
+          # The native installer compares this marker and skips recopies.
+          # (Not a dotfile: aapt2 drops hidden asset entries.)
+          date -u +%Y%m%d%H%M%S > "$ASSETS/bundle-version.txt"
+
+          echo "--- payload ---"
+          ls -lh "$LIBDIR"
+          du -sh "$ASSETS"
+          ls "$ASSETS" | head -20
+
+      # --- build ------------------------------------------------------------
 
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
@@ -84,13 +177,32 @@ jobs:
 
       - run: npm ci
 
+      - name: Setup Android signing
+        run: |
+          set -euo pipefail
+          # Gradle signs the per-ABI APK with the release key; the merged
+          # universal APK is re-signed after the merge step.
+          if [ -n "${{ secrets.ANDROID_KEY_BASE64 }}" ]; then
+            cd src-tauri/gen/android
+            base64 -d <<< "${{ secrets.ANDROID_KEY_BASE64 }}" > "$RUNNER_TEMP/keystore.jks"
+            {
+              echo "keyAlias=${{ secrets.ANDROID_KEY_ALIAS }}"
+              echo "password=${{ secrets.ANDROID_KEY_PASSWORD }}"
+              echo "keyPassword=${{ secrets.ANDROID_KEY_PASSWORD }}"
+              echo "storeFile=$RUNNER_TEMP/keystore.jks"
+            } > keystore.properties
+          else
+            echo "::warning::ANDROID_KEY_BASE64 not configured - per-ABI APKs will be signed in the merge job only"
+          fi
+
       - name: Build APK (${{ matrix.label }})
         run: npx tauri android build --apk --target ${{ matrix.target }}
         env:
-          NDK_HOME: ${{ env.ANDROID_HOME }}/ndk/29.0.14206865
+          NDK_HOME: ${{ env.ANDROID_HOME }}/ndk/${{ env.NDK_VERSION }}
 
       - name: Collect APK
         run: |
+          set -euo pipefail
           mkdir -p out
           APK=$(find src-tauri/gen/android/app/build/outputs/apk -name '*.apk' -type f | head -1)
           if [ -z "$APK" ]; then
@@ -99,6 +211,16 @@ jobs:
           fi
           cp "$APK" "out/OpenCodeUI-${{ matrix.label }}.apk"
           ls -lh out/
+
+          echo "--- embedded payload in the APK ---"
+          unzip -l "out/OpenCodeUI-${{ matrix.label }}.apk" |
+            grep -E "lib/${{ matrix.abi }}/(libopencode_node|librg|libc\+\+_shared)\.so|assets/opencode/opencode\.mjs" ||
+            { echo "::error::embedded payload missing from the APK"; exit 1; }
+
+          echo "--- native lib extraction ---"
+          "$ANDROID_HOME/build-tools/36.0.0/aapt2" dump xmltree \
+            "out/OpenCodeUI-${{ matrix.label }}.apk" --file AndroidManifest.xml |
+            grep -i extractNativeLibs || echo "::warning::extractNativeLibs not found in the manifest"
 
       - uses: actions/upload-artifact@v7
         with:
@@ -152,6 +274,22 @@ jobs:
           "$BT/zipalign" -p -f 4 dist/universal-unaligned.apk dist/universal-aligned.apk
           "$BT/zipalign" -c -p 4 dist/universal-aligned.apk
 
+      - name: Verify merged payload
+        run: |
+          set -euo pipefail
+          for entry in \
+            "lib/arm64-v8a/libopencode_node.so" \
+            "lib/armeabi-v7a/libopencode_node.so" \
+            "lib/arm64-v8a/librg.so" \
+            "lib/armeabi-v7a/librg.so" \
+            "assets/opencode/opencode.mjs"; do
+            if ! unzip -l dist/universal-aligned.apk | grep -q "$entry"; then
+              echo "::error::missing from universal APK: $entry"
+              exit 1
+            fi
+          done
+          unzip -l dist/universal-aligned.apk | grep -E "lib/.*\.so" | awk '{print $1, $4}'
+
       - name: Prepare signing key
         id: signing
         run: |
@@ -189,9 +327,10 @@ jobs:
             --key-pass "pass:${{ steps.signing.outputs.pass }}" \
             --out "$OUT" \
             dist/universal-aligned.apk
-          "$BT/apksigner" verify --verbose "$OUT" | head -20
-          echo "--- native libs in signed apk ---"
-          unzip -l "$OUT" | grep -E "lib/.*\.so" | awk '{print $4}'
+          echo "--- signature ---"
+          "$BT/apksigner" verify --verbose --print-certs "$OUT" | head -30
+          "$BT/apksigner" verify "$OUT"
+          echo "--- universal APK ---"
           ls -lh "$OUT"
 
       - uses: actions/upload-artifact@v7
@@ -199,16 +338,3 @@ jobs:
           name: apk-universal
           path: dist/OpenCodeUI-*-android-universal.apk
           retention-days: 30
-
-      - name: Publish release
-        if: startsWith(github.ref, 'refs/tags/')
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ github.ref_name }}
-          name: 'OpenCodeUI ${{ github.ref_name }} (Android universal)'
-          body: 'Android APK with both arm64-v8a and armeabi-v7a native libraries.'
-          files: dist/OpenCodeUI-*-android-universal.apk
-          draft: false
-          prerelease: false
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -19,6 +19,10 @@ import androidx.core.view.WindowInsetsControllerCompat
 
 class MainActivity : TauriActivity() {
 
+  companion object {
+    private const val REQUEST_STORAGE = 4201
+  }
+
   private val handler = Handler(Looper.getMainLooper())
   private var cachedInsetsJs: String? = null
   private var themeSyncRunnable: Runnable? = null
@@ -182,6 +186,122 @@ class MainActivity : TauriActivity() {
         @Suppress("DEPRECATION")
         vibrator.vibrate(duration)
       }
+    }
+
+    /**
+     * Installs the bundled opencode server (APK assets) into the app's
+     * private storage and returns the destination directory.
+     *
+     * The server bundle is arch independent, so it ships once in the APK and
+     * is expanded on first use (or after an app update, when the version
+     * marker changes); `node` itself lives in nativeLibraryDir.
+     */
+    @android.webkit.JavascriptInterface
+    fun installAssets(prefix: String): String {
+      return try {
+        val dest = java.io.File(filesDir, prefix)
+        val assetVersion = try {
+          assets.open("$prefix/bundle-version.txt").bufferedReader().use { it.readText().trim() }
+        } catch (_: Exception) {
+          ""
+        }
+        val installedVersion = try {
+          java.io.File(dest, "bundle-version.txt").readText().trim()
+        } catch (_: Exception) {
+          ""
+        }
+        if (assetVersion.isEmpty() || assetVersion != installedVersion) {
+          dest.deleteRecursively()
+          dest.mkdirs()
+          copyAssetTree(prefix, dest)
+        }
+        dest.absolutePath
+      } catch (_: Exception) {
+        ""
+      }
+    }
+
+    /** nativeLibraryDir: the only directory an app may exec() from on API 29+. */
+    @android.webkit.JavascriptInterface
+    fun nativeLibraryDir(): String {
+      return try {
+        applicationInfo.nativeLibraryDir
+      } catch (_: Exception) {
+        ""
+      }
+    }
+
+    /** True when the app may read/write shared storage. */
+    @android.webkit.JavascriptInterface
+    fun hasStoragePermission(): Boolean = this@MainActivity.hasStoragePermission()
+
+    /**
+     * Opens the system screen where the user can grant all-files access
+     * (API 30+) or requests the legacy storage permissions (API 23-29).
+     */
+    @android.webkit.JavascriptInterface
+    fun requestStoragePermission() {
+      if (hasStoragePermission()) return
+      handler.post { this@MainActivity.requestStoragePermission() }
+    }
+  }
+
+  private fun hasStoragePermission(): Boolean {
+    return try {
+      if (Build.VERSION.SDK_INT >= 30) {
+        android.os.Environment.isExternalStorageManager()
+      } else {
+        checkSelfPermission(android.Manifest.permission.READ_EXTERNAL_STORAGE) ==
+          android.content.pm.PackageManager.PERMISSION_GRANTED
+      }
+    } catch (_: Exception) {
+      false
+    }
+  }
+
+  private fun requestStoragePermission() {
+    if (hasStoragePermission()) return
+    try {
+      if (Build.VERSION.SDK_INT >= 30) {
+        val intent = android.content.Intent(
+          android.provider.Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION
+        )
+        intent.data = android.net.Uri.parse("package:$packageName")
+        startActivity(intent)
+      } else {
+        requestPermissions(
+          arrayOf(
+            android.Manifest.permission.READ_EXTERNAL_STORAGE,
+            android.Manifest.permission.WRITE_EXTERNAL_STORAGE
+          ),
+          REQUEST_STORAGE
+        )
+      }
+    } catch (_: Exception) {
+      // Some OEM builds only ship the global screen.
+      try {
+        startActivity(
+          android.content.Intent(android.provider.Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION)
+        )
+      } catch (_: Exception) {
+        // nothing else we can do
+      }
+    }
+  }
+
+  /** Recursively copies an APK asset tree into the app's files dir. */
+  private fun copyAssetTree(assetPath: String, dest: java.io.File) {
+    val children = assets.list(assetPath)
+    if (children == null || children.isEmpty()) {
+      dest.parentFile?.mkdirs()
+      assets.open(assetPath).use { input ->
+        dest.outputStream().use { output -> input.copyTo(output) }
+      }
+      return
+    }
+    dest.mkdirs()
+    for (child in children) {
+      copyAssetTree("$assetPath/$child", java.io.File(dest, child))
     }
   }
 

@@ -15,6 +15,8 @@ import { serviceStore } from './store/serviceStore'
 import { wslStore } from './store/wslStore'
 import { reconnectSSE, reconnectServerSSE } from './api/events'
 import { getSDKClientAsync, invalidateSDKClient } from './api/sdk'
+import { installServerAssets, startEmbeddedServer } from './api/embedded'
+import { embeddedStore } from './store/embeddedStore'
 import { resetPathModeCache } from './utils/directoryUtils'
 import { isTauri, isTauriMobile } from './utils/tauri'
 import { apiErrorHandler, globalErrorHandler } from './utils/errorHandling'
@@ -181,6 +183,33 @@ async function initializeNativeDesktopService() {
   }
 }
 
+/**
+ * Android: the opencode server runs **inside** the app.
+ *
+ * The server bundle ships with the APK (assets) and is expanded into the
+ * app's private storage on first launch; the bundled Node runtime then
+ * executes it. The resulting URL + password are written back to the "local"
+ * server entry, exactly like the desktop flow does for `opencode serve`.
+ */
+async function initializeNativeEmbeddedService() {
+  if (!isNativeTauri || !isNativeTauriMobile) return
+  if (!embeddedStore.autoStart) return
+
+  try {
+    await installServerAssets('opencode')
+    const result = await startEmbeddedServer({
+      workspace: embeddedStore.workspace || null,
+      envVars: embeddedStore.activeEnvVars,
+    })
+    applyLocalServiceUrl(result.url, result.serverPassword)
+    if (result.started) {
+      console.info('[Embedded] opencode server started on device')
+    }
+  } catch (err) {
+    apiErrorHandler('start embedded opencode server', err)
+  }
+}
+
 configureNativeShell()
 
 // 全局错误处理 - 防止未捕获错误导致页面刷新
@@ -214,6 +243,7 @@ function startApp() {
   bootstrap()
 
   void initializeNativeDesktopService()
+  void initializeNativeEmbeddedService()
 
   if (isNativeTauri) {
     void getSDKClientAsync().catch(err => apiErrorHandler('initialize sdk client', err))

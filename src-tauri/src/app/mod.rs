@@ -303,7 +303,10 @@ fn configure_desktop_window_builder<'a, R: tauri::Runtime, M: tauri::Manager<R>>
 }
 
 pub fn run() {
-    let builder = tauri::Builder::default().manage(BridgeState::default());
+    let builder = tauri::Builder::default()
+        .manage(BridgeState::default())
+        // Android 内嵌服务端状态（桌面端由 ServiceState 承担）
+        .manage(commands::embedded::EmbeddedServerState::default());
 
     #[cfg(not(target_os = "android"))]
     let builder = builder.plugin(tauri_plugin_decorum::init());
@@ -515,12 +518,17 @@ pub fn run() {
             commands::wsl_commands::install_wsl_opencode,
         ]);
 
-    // Android: 注册 bridge commands
+    // Android: 注册 bridge commands + 内嵌 opencode 服务端
     #[cfg(target_os = "android")]
     let builder = builder.invoke_handler(tauri::generate_handler![
         commands::bridge::bridge_connect,
         commands::bridge::bridge_send,
         commands::bridge::bridge_disconnect,
+        commands::embedded::embedded_server_info,
+        commands::embedded::start_embedded_server,
+        commands::embedded::stop_embedded_server,
+        commands::embedded::workspace_candidates,
+        commands::embedded::list_workspace_dirs,
     ]);
 
     // build + run 分开调用，以支持 macOS RunEvent::Opened

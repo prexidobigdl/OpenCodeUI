@@ -64,6 +64,8 @@
   "tabs": {
     "servers": "Servers",
     "serversDesc": "Backend connections and fast active endpoint switching",
+    "embedded": "On-device",
+    "embeddedDesc": "The OpenCode server running inside this app",
     "models": "Models",
     "modelsDesc": "Choose which models stay available in the selector",
     "providers": "Providers",

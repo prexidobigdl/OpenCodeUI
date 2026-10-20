@@ -1,0 +1,107 @@
+name: Publish Android Release
+
+# Manual release publishing. The build workflow only produces artifacts;
+# a maintainer decides when (and with which notes) they become a release.
+#
+# Typical use:
+#   1. Run "Android Universal APK" and note the run id.
+#   2. Run this workflow with that id and the release tag.
+#
+# Leaving `run_id` empty uses the latest successful build of the APK
+# workflow.
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: 'Run ID of the "Android Universal APK" workflow (empty = latest successful)'
+        required: false
+        type: string
+      tag:
+        description: 'Release tag, e.g. v0.7.21-android.1'
+        required: true
+        type: string
+      name:
+        description: 'Release title (empty = tag)'
+        required: false
+        type: string
+      body:
+        description: 'Release notes (empty = generated notes)'
+        required: false
+        type: string
+      prerelease:
+        description: 'Mark as pre-release'
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  actions: read
+
+jobs:
+  publish:
+    name: Publish release
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Resolve build run
+        id: build
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          RUN_ID="${{ inputs.run_id }}"
+          if [ -z "$RUN_ID" ]; then
+            RUN_ID=$(gh run list --workflow android.yml --status success --limit 1 \
+              --json databaseId --jq '.[0].databaseId')
+          fi
+          if [ -z "$RUN_ID" ] || [ "$RUN_ID" = "null" ]; then
+            echo "::error::no successful build found - pass a run id"
+            exit 1
+          fi
+          echo "run_id=$RUN_ID" >> "$GITHUB_OUTPUT"
+          echo "using build run $RUN_ID"
+
+      - name: Download universal APK
+        uses: actions/download-artifact@v8
+        with:
+          name: apk-universal
+          path: dist
+          run-id: ${{ steps.build.outputs.run_id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Show files
+        run: ls -lh dist
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ inputs.tag }}
+          TITLE: ${{ inputs.name }}
+          BODY: ${{ inputs.body }}
+          PRERELEASE: ${{ inputs.prerelease }}
+        run: |
+          set -euo pipefail
+          TITLE="${TITLE:-$TAG}"
+          ARGS=(--title "$TITLE")
+
+          if [ -n "$BODY" ]; then
+            printf '%s' "$BODY" > notes.md
+            ARGS+=(--notes-file notes.md)
+          else
+            ARGS+=(--generate-notes)
+          fi
+          if [ "$PRERELEASE" = "true" ]; then
+            ARGS+=(--prerelease)
+          fi
+
+          # Replace an existing draft/tag release if the tag already exists.
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/*.apk --clobber
+            gh release edit "$TAG" "${ARGS[@]}"
+          else
+            gh release create "$TAG" dist/*.apk "${ARGS[@]}"
+          fi

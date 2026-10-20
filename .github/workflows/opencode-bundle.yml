@@ -16,6 +16,9 @@ name: OpenCode Server Bundle
 # (file watching disabled, ripgrep fallback, no terminal).
 
 on:
+  # Called by android.yml; the bundle is arch independent and is embedded
+  # once into the APK assets.
+  workflow_call:
   workflow_dispatch:
   push:
     branches:

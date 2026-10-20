@@ -39,7 +39,8 @@ android {
                 storeFile = file(ksFile)
                 storePassword = keystoreProperties.getProperty("password")
                 keyAlias = keystoreProperties.getProperty("keyAlias")
-                keyPassword = keystoreProperties.getProperty("password")
+                keyPassword = keystoreProperties.getProperty("keyPassword")
+                    ?: keystoreProperties.getProperty("password")
             }
         }
     }
@@ -68,6 +69,12 @@ android {
                     .plus(getDefaultProguardFile("proguard-android-optimize.txt"))
                     .toList().toTypedArray()
             )
+            packaging {
+                // The bundled Node runtime lives in jniLibs: the package
+                // manager extracts it to nativeLibraryDir, the only place an
+                // Android app is allowed to exec() from (API 29+).
+                jniLibs.useLegacyPackaging = true
+            }
         }
     }
     kotlinOptions {

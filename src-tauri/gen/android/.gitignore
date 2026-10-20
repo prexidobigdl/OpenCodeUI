@@ -14,6 +14,8 @@ build
 .cxx
 local.properties
 key.properties
+# Release signing key (contains the password) — see keystore.properties.example
+keystore.properties
 
 /.tauri
 /tauri.settings.gradle

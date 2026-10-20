@@ -17,7 +17,7 @@ import {
   KeyIcon,
 } from '../../components/Icons'
 import { useIsMobile } from '../../hooks'
-import { isTauri } from '../../utils/tauri'
+import { isTauri, isTauriMobile } from '../../utils/tauri'
 import { KeybindingsSection } from './KeybindingsSection'
 import { AgentSettings } from './components/AgentSettings'
 import { AppearanceSettings } from './components/AppearanceSettings'
@@ -28,6 +28,7 @@ import { ProvidersSettings } from './components/ProvidersSettings'
 import { NotificationSettings } from './components/NotificationSettings'
 import { ServiceSettings } from './components/ServiceSettings'
 import { ServersSettings } from './components/ServersSettings'
+import { EmbeddedAgentSettings } from './components/EmbeddedAgentSettings'
 import { WorkspaceSettings } from './components/WorkspaceSettings'
 import { ConfigSettings } from './components/ConfigSettings'
 import { SettingsSearch } from './SettingsSearch'
@@ -47,6 +48,7 @@ export type SettingsTab =
   | 'service'
   | 'config'
   | 'servers'
+  | 'embedded'
   | 'keybindings'
   | 'workspace'
   | 'about'
@@ -63,6 +65,7 @@ interface SettingsDialogProps {
 
 const TAB_ICONS: Record<SettingsTab, React.ReactNode> = {
   servers: <GlobeIcon size={15} />,
+  embedded: <PlugIcon size={15} />,
   agent: <AgentIcon size={15} />,
   chat: <MessageSquareIcon size={15} />,
   models: <CpuIcon size={15} />,
@@ -78,6 +81,7 @@ const TAB_ICONS: Record<SettingsTab, React.ReactNode> = {
 
 const TAB_IDS: SettingsTab[] = [
   'servers',
+  'embedded',
   'models',
   'providers',
   'agent',
@@ -93,6 +97,7 @@ const TAB_IDS: SettingsTab[] = [
 
 const TAB_LABEL_KEYS: Record<SettingsTab, string> = {
   servers: 'tabs.servers',
+  embedded: 'tabs.embedded',
   agent: 'tabs.agent',
   chat: 'tabs.chat',
   models: 'tabs.models',
@@ -107,7 +112,7 @@ const TAB_LABEL_KEYS: Record<SettingsTab, string> = {
 }
 
 const GROUP_DEFS: { labelKey: string; tabs: SettingsTab[] }[] = [
-  { labelKey: 'groups.core', tabs: ['servers', 'models', 'providers', 'agent', 'chat', 'workspace', 'appearance', 'notifications'] },
+  { labelKey: 'groups.core', tabs: ['servers', 'embedded', 'models', 'providers', 'agent', 'chat', 'workspace', 'appearance', 'notifications'] },
   { labelKey: 'groups.advanced', tabs: ['service', 'config', 'keybindings', 'about'] },
 ]
 
@@ -135,6 +140,8 @@ function TabContent({ tab }: { tab: SettingsTab }) {
       return <ConfigSettings />
     case 'servers':
       return <ServersSettings />
+    case 'embedded':
+      return <EmbeddedAgentSettings />
     case 'keybindings':
       return <KeybindingsSection />
     case 'workspace':
@@ -154,19 +161,27 @@ export function SettingsDialog({ isOpen, onClose, initialTab = 'servers' }: Sett
   const { t } = useTranslation(['settings', 'commands'])
   const isMobile = useIsMobile()
   const isTauriDesktop = isTauri() && !isMobile
+  // Android runs the server inside the app: the remote server list is hidden
+  // and replaced by the on-device configuration.
+  const isAndroidApp = isTauri() && isTauriMobile()
   const scrollRef = useRef<HTMLDivElement>(null)
   const highlightFrameRef = useRef<number | null>(null)
   const highlightTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
-  const normalizeTab = useCallback((next: SettingsDialogProps['initialTab']): SettingsTab => {
-    if (!next || next === 'general') return 'servers'
-    return next
-  }, [])
+  const normalizeTab = useCallback(
+    (next: SettingsDialogProps['initialTab']): SettingsTab => {
+      if (!next || next === 'general') return isAndroidApp ? 'embedded' : 'servers'
+      if (isAndroidApp && next === 'servers') return 'embedded'
+      return next
+    },
+    [isAndroidApp],
+  )
   const [tab, setTab] = useState<SettingsTab>(normalizeTab(initialTab))
 
-  const visibleTabIds = useMemo(
-    () => (isTauriDesktop ? TAB_IDS : TAB_IDS.filter(id => id !== 'service')),
-    [isTauriDesktop],
-  )
+  const visibleTabIds = useMemo(() => {
+    if (isAndroidApp) return TAB_IDS.filter(id => id !== 'servers' && id !== 'service')
+    if (isTauriDesktop) return TAB_IDS.filter(id => id !== 'embedded')
+    return TAB_IDS.filter(id => id !== 'service' && id !== 'embedded')
+  }, [isAndroidApp, isTauriDesktop])
 
   const visibleTabs = useMemo(
     () =>
