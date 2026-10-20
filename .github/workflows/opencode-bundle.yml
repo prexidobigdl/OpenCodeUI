@@ -68,6 +68,15 @@ jobs:
           set -euo pipefail
           bun install --frozen-lockfile --os=* --cpu=*
 
+      - name: Apply Android patches
+        working-directory: opencode-src
+        run: |
+          set -euo pipefail
+          # node-pty has no bionic build; make the backend optional instead of
+          # letting the eager require() abort the server at startup.
+          git apply "$GITHUB_WORKSPACE/patches/opencode-optional-node-pty.patch"
+          echo "patched"
+
       - name: Build Node bundle
         working-directory: opencode-src/packages/cli
         run: |
@@ -92,8 +101,30 @@ jobs:
         run: |
           set -euo pipefail
           node --version
-          # `opencode --version` must work from the bundle alone.
           node dist-node/opencode.mjs --version
+
+      - name: Smoke test server
+        working-directory: opencode-src/packages/cli
+        run: |
+          set -euo pipefail
+          # Boot the real server and talk to it: this is the "bun -> node" port.
+          node dist-node/opencode.mjs serve --hostname 127.0.0.1 --port 4096 > server.log 2>&1 &
+          SERVER_PID=$!
+          trap 'kill $SERVER_PID 2>/dev/null || true' EXIT
+          for i in $(seq 1 60); do
+            if grep -q "server listening on" server.log; then break; fi
+            if ! kill -0 $SERVER_PID 2>/dev/null; then
+              echo "server exited early:"; cat server.log; exit 1
+            fi
+            sleep 1
+          done
+          cat server.log
+          URL=$(grep -oE "server listening on http://[^ ]+" server.log | head -1 | sed 's/server listening on //')
+          PASS=$(grep -oE "server password .+" server.log | head -1 | sed 's/server password //')
+          echo "url=$URL password=$PASS"
+          curl -sS -u "opencode:$PASS" "$URL/api/info" | tee info.json
+          echo
+          grep -q '"version"' info.json
 
       - name: Upload bundle
         uses: actions/upload-artifact@v7

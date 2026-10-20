@@ -99,7 +99,6 @@ jobs:
             --openssl-no-asm \
             --cross-compiling \
             --without-npm \
-            --without-corepack \
             --with-intl=small-icu
           echo "configured"
 

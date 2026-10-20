@@ -1,0 +1,38 @@
+Make the node-pty backend optional.
+
+On platforms without a native node-pty build (Android/bionic, where the
+prebuilt glibc `pty.node` cannot be loaded) the eager `require()` at module
+scope aborts the whole server at startup. Terminal features are optional for
+the Android build, so degrade instead of crashing: the module loads, and only
+an actual terminal spawn throws.
+
+diff --git a/packages/core/src/pty/pty.node.ts b/packages/core/src/pty/pty.node.ts
+index 1111111..2222222 100644
+--- a/packages/core/src/pty/pty.node.ts
++++ b/packages/core/src/pty/pty.node.ts
+@@ -6,8 +6,20 @@ import type { Opts, Proc } from "./pty.js"
+
+ export type { Disp, Exit, Opts, Proc } from "./pty.js"
+
+-const pty = createRequire(import.meta.url)(process.env.OPENCODE_NODE_PTY_PATH ?? "@lydell/node-pty") as {
+-  spawn: typeof spawn
+-}
++const pty = (() => {
++  try {
++    return createRequire(import.meta.url)(process.env.OPENCODE_NODE_PTY_PATH ?? "@lydell/node-pty") as {
++      spawn: typeof spawn
++    }
++  } catch {
++    // No native PTY backend for this platform (e.g. Android/bionic, where the
++    // prebuilt glibc `pty.node` cannot be loaded). Terminal features degrade,
++    // the rest of the server keeps working.
++    return {
++      spawn: () => {
++        throw new Error("PTY is not available on this platform")
++      },
++    } as { spawn: typeof spawn }
++  }
++})()
+
+ function spawnPty(file: string, args: string[], opts: Opts): Proc {
+   const proc = pty.spawn(file, args, process.platform === "win32" && isSea() ? { ...opts, useConptyDll: true } : opts)
