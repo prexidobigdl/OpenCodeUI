@@ -1,0 +1,133 @@
+name: Node.js for Android
+
+# Builds a Node.js runtime that targets Android (bionic) so the opencode v2
+# server can run inside the APK instead of Bun.
+#
+# Uses Node's official Android build path:
+#   ./android-configure <ndk> <api-level> <arch>
+# which runs configure with --dest-os=android for arm64 / arm (32-bit).
+#
+# The produced binary is a plain ELF executable that runs on bionic devices.
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - 'feature/node-android-runtime'
+    paths:
+      - '.github/workflows/node-android.yml'
+  schedule:
+    # weekly rebuild so the runtime can be refreshed without touching the app
+    - cron: '37 4 * * 1'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: node-android-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: node-${{ matrix.arch }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: arm64
+            dest_cpu: arm64
+            toolchain: aarch64-linux-android
+          - arch: arm
+            dest_cpu: arm
+            toolchain: armv7a-linux-androideabi
+
+    env:
+      NDK_VERSION: '29.0.14206865'
+      NODE_VERSION: 'v26.4.0'
+      ANDROID_API: '24'
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          repository: nodejs/node
+          ref: ${{ env.NODE_VERSION }}
+          path: node-src
+          submodules: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential ca-certificates curl git gn ninja-build patch \
+            python3 python3-distutils
+
+      - uses: android-actions/setup-android@v3
+        with:
+          packages: 'platform-tools'
+
+      - name: Install NDK
+        run: sdkmanager "ndk;$NDK_VERSION"
+
+      - name: Configure for Android (${{ matrix.arch }})
+        working-directory: node-src
+        run: |
+          set -euo pipefail
+          chmod +x android-configure tools/create_android_makefiles
+
+          # Node's Android support needs the v8 trap-handler patch.
+          ./android-configure patch
+
+          NDK="$ANDROID_HOME/ndk/$NDK_VERSION"
+          TOOLCHAIN="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          export PATH="$TOOLCHAIN:$PATH"
+          export CC="$TOOLCHAIN/${{ matrix.toolchain }}$ANDROID_API-clang"
+          export CXX="$TOOLCHAIN/${{ matrix.toolchain }}$ANDROID_API-clang++"
+          export GYP_DEFINES="target_arch=${{ matrix.dest_cpu }} \
+            v8_target_arch=${{ matrix.dest_cpu }} \
+            android_target_arch=${{ matrix.dest_cpu }} \
+            host_os=linux OS=android android_ndk_path=$NDK"
+
+          # npm/corepack are not needed: the app ships a prebuilt JS bundle.
+          # small-icu keeps Intl working without building the full ICU data set.
+          ./configure \
+            --dest-os=android \
+            --dest-cpu=${{ matrix.dest_cpu }} \
+            --openssl-no-asm \
+            --cross-compiling \
+            --without-npm \
+            --without-corepack \
+            --with-intl=small-icu
+          echo "configured"
+
+      - name: Build
+        working-directory: node-src
+        run: |
+          set -euo pipefail
+          make -j"$(nproc)"
+          ls -lh out/Release/node
+          file out/Release/node || true
+
+      - name: Smoke test (host, if runnable)
+        working-directory: node-src
+        run: |
+          set -euo pipefail
+          # The binary targets bionic, so it usually cannot run on the Linux
+          # runner. Report the outcome instead of failing the build.
+          if ./out/Release/node -e 'console.log(process.version, process.arch, process.platform)' ; then
+            echo "host-exec ok"
+          else
+            echo "host-exec skipped (expected: bionic binary on glibc runner)"
+          fi
+
+      - name: Upload runtime
+        uses: actions/upload-artifact@v7
+        with:
+          name: node-android-${{ matrix.arch }}
+          path: |
+            node-src/out/Release/node
+          retention-days: 14
